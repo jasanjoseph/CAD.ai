@@ -1,0 +1,25 @@
+# Core graph
+langgraph>=0.6
+langchain-core>=0.3
+
+# LLM providers (use whichever you have keys for)
+langchain-google-genai>=2.1   # free Gemini tier: chat + embeddings
+langchain-openai>=0.3         # optional: OpenAI chat / embeddings
+langchain-anthropic>=0.3      # optional: Anthropic chat
+
+# RAG / rulebook indexing
+langchain-chroma>=0.2
+langchain-community>=0.3
+langchain-text-splitters>=0.3
+pypdf>=5
+
+# Geometry / heuristics
+trimesh>=4.4
+numpy>=2.0
+scipy>=1.13
+rtree>=1.2
+networkx>=3.3
+pydantic>=2.7
+
+# Optional: only needed for .step / .stp files (heavy; install separately if required)
+# cadquery>=2.4

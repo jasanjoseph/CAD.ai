@@ -1,0 +1,24 @@
+Sample BAJA SAE-style rulebook extract (synthetic, for demo purposes only)
+==========================================================================
+
+T-1 SCOPE
+T-1.1 These rules apply to every bracket, mount and structural member manufactured for the vehicle.
+
+T-2 ENVELOPE AND MASS
+T-2.1 The maximum bounding-box dimension of any single mounted bracket shall not exceed 350 mm.
+T-2.7 The mass of any individual bracket, at the specified material density, shall not exceed 0.50 kg.
+T-2.8 The total volume of any single bracket shall not exceed 0.002 m^3.
+T-2.9 Any bracket larger than 500 mm in its longest dimension requires a secondary mounting point.
+
+T-3 MATERIAL
+T-3.1 Structural brackets shall be manufactured from AISI 4130 or AISI 4140 steel, or from 6061-T6 aluminium.
+T-3.2 Material certification (mill certificate) must accompany every bracket at inspection. [not checkable from geometry]
+
+T-4 GEOMETRY AND STRESS CONCENTRATION
+T-4.1 Minimum wall thickness of any load-bearing bracket wall is 3.0 mm.
+T-4.2 Every internal corner in a load path shall have a fillet radius of at least 3.0 mm. [not directly checkable from a mesh without a radius measurement tool]
+T-4.3 Abrupt changes of cross-section shall be blended over a length of at least 1.5 times the smaller section dimension.
+
+T-5 MANUFACTURING
+T-5.1 All welds shall be performed by a certified welder using a written weld procedure. [not checkable from geometry]
+T-5.2 Bracket holes shall be drilled, not punched, unless edge distance exceeds 2 times the hole diameter. [not checkable from geometry]
