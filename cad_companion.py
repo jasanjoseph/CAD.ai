@@ -50,7 +50,7 @@ from typing import Any, Literal, TypedDict
 
 import numpy as np
 import trimesh
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 
 try:  # optional: lets you keep keys in a local .env instead of the shell
     from dotenv import load_dotenv
@@ -90,7 +90,7 @@ class Settings:
             llm_provider=llm_provider,
             openai_model=os.getenv("OPENAI_MODEL", "gpt-4o"),
             anthropic_model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5-5"),
-            gemini_model=os.getenv("GEMINI_MODEL", "gemini-3.8-flash"),
+            gemini_model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash"),
             # Embeddings must come from the same model at ingest and query time.
             # With the Gemini free tier, keep both on Gemini (no OpenAI credits needed).
             embedding_provider=os.getenv("EMBEDDING_PROVIDER", "gemini" if llm_provider == "gemini" else "openai"),
@@ -113,8 +113,6 @@ MATERIAL_DENSITY_KG_M3 = {
     "ti_6al_4v": 4430.0,
 }
 
-MAX_STRESS_TOOL_ROUNDS = 6
-
 
 @functools.lru_cache(maxsize=1)
 def get_llm():
@@ -134,6 +132,49 @@ def get_llm():
 
 class CADToolError(RuntimeError):
     """Raised by any CAD tool. Never swallowed: it puts the graph in a failure state."""
+
+
+_QUOTA_RE = re.compile(r"retry in (\d+)h(\d+)m|retryDelay.*?(\d+)s")
+_PROVIDERS = {"googleapis.com": "Gemini", "openai.com": "OpenAI", "anthropic.com": "Anthropic"}
+
+
+def describe_llm_error(exc: BaseException) -> str:
+    """Turn a provider exception into one actionable line instead of a wall of JSON."""
+    text = str(exc)
+    host = next((name for domain, name in _PROVIDERS.items() if domain in text), None)
+    who = host or type(exc).__name__
+
+    if "RESOURCE_EXHAUSTED" in text or "insufficient_quota" in text or "credit_balance_exhausted" in text:
+        if "credit_balance_exhausted" in text or "insufficient_quota" in text:
+            return (
+                f"{who} rejected the request: your account has no API credits left. "
+                "Add credits at platform.openai.com, or switch to the free Gemini tier with LLM_PROVIDER=gemini."
+            )
+        m = _QUOTA_RE.search(text)
+        waits = [g for g in (m.groups() if m else ()) if g]
+        when = ""
+        if waits:
+            when = f" The free quota resets in {waits[0]}h {waits[1]}m." if len(waits) > 1 else f" Retry in {waits[0]}s."
+        model = re.search(r"model['\"]?:\s*['\"]?([\w.-]+)", text)
+        return (
+            f"{who} free-tier rate limit hit{f' on {model.group(1)}' if model else ''}. "
+            "Free tier allows a small number of requests per day, and one review uses several."
+            f"{when} Options: wait for the reset, set GEMINI_MODEL to another free model in .env, "
+            "or add API credits for a higher limit."
+        )
+
+    if "API_KEY_INVALID" in text or "Unauthorized" in text or "401" in text:
+        return f"{who} says the API key is invalid or missing. Check GOOGLE_API_KEY / OPENAI_API_KEY in .env."
+
+    if "NOT_FOUND" in text and "model" in text:
+        m = re.search(r"models/([\w.-]+)", text)
+        return (
+            f"Model '{m.group(1) if m else 'unknown'}' is not available on your account. "
+            "Set GEMINI_MODEL (or OPENAI_MODEL / ANTHROPIC_MODEL) in .env to a model your key can access."
+        )
+
+    short = text.replace("\n", " ")
+    return f"{who} call failed: {short[:220]}"
 
 
 # =============================================================================
@@ -688,19 +729,19 @@ Your arithmetic will be re-checked by code; wrong verdicts are overwritten and l
 """
 
 STRESS_SYSTEM_PROMPT = """\
-You are the Stress/FEA Review agent. You screen geometry for stress concentrators using Python heuristic tools.
+You are the Stress/FEA Review agent. The pipeline has ALREADY screened the geometry with three
+deterministic Python heuristics, whose results are supplied to you: `check_sharp_internal_radii`
+(concave corners with no fillet), `check_section_changes` (abrupt area changes along X/Y/Z) and
+`check_thin_walls` (locally thin regions). You have no tools to call.
 
-Procedure:
-1. Call ALL THREE tools: `check_sharp_internal_radii`, `check_section_changes`, `check_thin_walls`. Defaults are
-   fine; adjust a threshold only if the part description clearly justifies it, within the schema bounds.
-2. After the tool results arrive, write a qualitative note (max 120 words) grouping the hotspots by likely
-   load-path interaction (e.g. a thin web next to a sharp corner).
+Your single task: write a qualitative note (max 120 words) grouping the supplied hotspots by likely
+load-path interaction (e.g. a thin web next to a sharp corner).
 
 Hard rules:
-- File path and units are fixed by the pipeline. Do not change them.
-- Do not introduce any number that is not in a tool result. Never state a stress value (MPa), safety factor or
-  fatigue life: these heuristics do not compute stress.
+- Do not introduce any number that is not in the supplied tool results. Never state a stress value
+  (MPa), safety factor or fatigue life: these heuristics do not compute stress.
 - Never describe the design as "safe" or "passing". You are screening; a solver or an engineer decides.
+- If the note cannot be written, output nothing rather than inventing analysis.
 """
 
 REPORTER_SYSTEM_PROMPT = """\
@@ -854,7 +895,7 @@ def safe_node(step: str):
                 update = fn(state)
             except Exception as exc:  # noqa: BLE001
                 log.exception("Node %s failed", step)
-                return {"error": f"[{step}] {type(exc).__name__}: {exc}", "current_step": step}
+                return {"error": f"[{step}] {describe_llm_error(exc)}", "current_step": step}
             update["completed"] = [*state.get("completed", []), step]
             update.setdefault("current_step", step)
             return update
@@ -887,32 +928,61 @@ def route_from_orchestrator(state: AgentState) -> str:
 # ---- 6a. Geometry Extractor ----------------------------------------------------
 @safe_node("geometry_extractor")
 def geometry_extractor_node(state: AgentState) -> dict:
-    llm = get_llm()
-    try:
-        llm = llm.bind_tools([EXTRACT_TOOL], tool_choice="extract_geometry")
-    except (TypeError, ValueError, NotImplementedError):  # provider does not support forcing a tool
-        llm = llm.bind_tools([EXTRACT_TOOL])
-    ai = llm.invoke([
-        SystemMessage(GEOMETRY_SYSTEM_PROMPT),
-        HumanMessage(json.dumps({
-            "file_path": state["cad_file_path"], "units": state["units"],
-            "material": state["material"], "density_kg_m3": state["density_kg_m3"],
-        })),
-    ])
-    if not ai.tool_calls:
-        raise CADToolError("Geometry agent did not call extract_geometry; refusing to proceed without measurements.")
     locked = {"file_path": state["cad_file_path"], "units": state["units"],
               "material": state["material"], "density_kg_m3": state["density_kg_m3"]}
-    (_, props), *_ = execute_tool_calls(ai, {EXTRACT_TOOL.name: EXTRACT_TOOL}, locked)
-    return {"extracted_properties": props}
+    tool_map = {EXTRACT_TOOL.name: EXTRACT_TOOL}
+
+    # Intended path: the agent relays the locked arguments as a tool call.
+    try:
+        llm = get_llm()
+        try:
+            llm = llm.bind_tools([EXTRACT_TOOL], tool_choice="extract_geometry")
+        except (TypeError, ValueError, NotImplementedError):  # provider does not support forcing a tool
+            llm = llm.bind_tools([EXTRACT_TOOL])
+        ai = llm.invoke([
+            SystemMessage(GEOMETRY_SYSTEM_PROMPT),
+            HumanMessage(json.dumps(locked)),
+        ])
+        if ai.tool_calls:
+            (_, props), *_ = execute_tool_calls(ai, tool_map, locked)
+            return {"extracted_properties": props}
+        log.warning("Geometry agent made no tool call; falling back to a direct deterministic call.")
+    except Exception as exc:  # noqa: BLE001 - the tool itself validates, so fall back rather than fail
+        log.warning("Geometry LLM path failed (%s); falling back to a direct deterministic call.", exc)
+
+    # Fallback: measurement is pure Python, so the review never depends on an LLM round-trip.
+    return {"extracted_properties": EXTRACT_TOOL.invoke(locked)}
 
 
 # ---- 6b. Compliance Checker ----------------------------------------------------
+def _not_verifiable(reason: str, refs: dict[str, dict] | None = None) -> list[dict]:
+    """A finding that is honest about not having been checked (never an optimistic PASS)."""
+    rows = [{
+        "rule_ref": None, "rule_checked": "Compliance check could not be completed",
+        "status": "NOT_VERIFIABLE", "reasoning": reason,
+        "source": None, "limit_text": None, "property_key": None, "measured_value": None,
+        "comparator": None, "limit_value": None, "validation_notes": [],
+    }]
+    for ref, meta in (refs or {}).items():  # keep the retrieved refs visible for the auditor
+        rows.append({**rows[0], "rule_ref": ref, "source": meta.get("source"),
+                     "rule_checked": f"Retrieved excerpt {ref} was not evaluated"})
+    return rows
+
+
 @safe_node("compliance_checker")
 def compliance_checker_node(state: AgentState) -> dict:
     props = state["extracted_properties"]
     flat = flatten_properties(props)
-    retriever = get_rulebook_retriever()
+
+    # A missing index or an unreachable LLM must not discard the review: every rule is
+    # reported as NOT_VERIFIABLE, which the verdict treats as "needs a human".
+    try:
+        retriever = get_rulebook_retriever()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Rulebook unavailable: %s", exc)
+        return {"compliance_status": _not_verifiable(
+            f"Rulebook index unavailable, so no rule was checked: {describe_llm_error(exc)} "
+            "Run: python cad_companion.py ingest <rulebook>")}
 
     queries = [
         "maximum overall vehicle or component dimensions length width height envelope",
@@ -930,29 +1000,34 @@ def compliance_checker_node(state: AgentState) -> dict:
                 seen.add(doc.page_content)
                 chunks.append(doc)
     chunks = chunks[:14]
+    if not chunks:
+        return {"compliance_status": _not_verifiable(
+            "Retrieval returned no rulebook excerpts, so no rule could be evaluated.")}
+
     refs = {f"R{i}": {"source": f"{d.metadata.get('source', '?')} p.{d.metadata.get('page', '?')}"}
             for i, d in enumerate(chunks, 1)}
     excerpts = "\n\n".join(f"[R{i}] ({refs[f'R{i}']['source']})\n{d.page_content}" for i, d in enumerate(chunks, 1))
 
-    llm = get_llm().with_structured_output(ComplianceReport)
-    report = llm.invoke([
-        SystemMessage(COMPLIANCE_SYSTEM_PROMPT),
-        HumanMessage(
-            f"Part description: {state['part_description'] or '(none given)'}\n\n"
-            f"MEASURED PROPERTIES (mm / kg; authoritative):\n{json.dumps(flat, indent=2)}\n\n"
-            f"RULEBOOK EXCERPTS:\n{excerpts}"
-        ),
-    ])
-    if report is None:
-        raise RuntimeError("Compliance LLM returned no structured output.")
-    findings = [validate_finding(f, flat, refs) for f in report.findings]
+    try:
+        llm = get_llm().with_structured_output(ComplianceReport)
+        report = llm.invoke([
+            SystemMessage(COMPLIANCE_SYSTEM_PROMPT),
+            HumanMessage(
+                f"Part description: {state['part_description'] or '(none given)'}\n\n"
+                f"MEASURED PROPERTIES (mm / kg; authoritative):\n{json.dumps(flat, indent=2)}\n\n"
+                f"RULEBOOK EXCERPTS:\n{excerpts}"
+            ),
+        ])
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Compliance LLM unavailable: %s", exc)
+        return {"compliance_status": _not_verifiable(
+            f"Rulebook excerpts were retrieved but the compliance model could not be reached: {describe_llm_error(exc)}",
+            refs)}
+
+    findings = [validate_finding(f, flat, refs) for f in (report.findings if report else [])]
     if not findings:
-        findings = [{
-            "rule_ref": None, "rule_checked": "No geometry-checkable rules found in retrieved excerpts",
-            "status": "NOT_VERIFIABLE", "reasoning": "Retrieval returned nothing the model could evaluate.",
-            "source": None, "limit_text": None, "property_key": None, "measured_value": None,
-            "comparator": None, "limit_value": None, "validation_notes": [],
-        }]
+        findings = _not_verifiable(
+            "Retrieval returned nothing the model could evaluate as a geometry-checkable rule.", refs)
     return {"compliance_status": findings}
 
 
@@ -961,30 +1036,26 @@ def compliance_checker_node(state: AgentState) -> dict:
 def stress_reviewer_node(state: AgentState) -> dict:
     tools = {t.name: t for t in STRESS_TOOLS}
     locked = {"file_path": state["cad_file_path"], "units": state["units"]}
-    llm = get_llm().bind_tools(STRESS_TOOLS)
 
-    messages: list[Any] = [
-        SystemMessage(STRESS_SYSTEM_PROMPT),
-        HumanMessage(json.dumps({"part_description": state["part_description"], **locked,
-                                 "bounding_box_xyz_mm": state["extracted_properties"]["bounding_box_xyz_mm"]})),
-    ]
-    results: dict[str, dict] = {}
+    # The three heuristics are pure Python: run them directly. They are the only source
+    # of hotspot data, so this costs nothing and cannot drift from what the LLM sees.
+    results: dict[str, dict] = {name: tool.invoke(locked) for name, tool in tools.items()}
+
+    # One LLM call for the qualitative grouping note (advisory prose only, no numbers).
     notes = ""
-    for _ in range(MAX_STRESS_TOOL_ROUNDS):
-        ai = llm.invoke(messages)
-        messages.append(ai)
-        if not ai.tool_calls:
-            txt = getattr(ai, "text", None)  # property in langchain-core >= 1.0, method before
-            notes = (txt if isinstance(txt, str) else txt() if callable(txt) else "") or str(ai.content)
-            break
-        for call, res in execute_tool_calls(ai, tools, locked):
-            results[call["name"]] = res
-            messages.append(ToolMessage(content=json.dumps(res), tool_call_id=call["id"]))
-
-    # Coverage guarantee: any heuristic the LLM skipped is run with defaults.
-    for name, tool in tools.items():
-        if name not in results:
-            results[name] = tool.invoke(locked)
+    try:
+        llm = get_llm()
+        payload = {
+            "part_description": state["part_description"], **locked,
+            "bounding_box_xyz_mm": state["extracted_properties"]["bounding_box_xyz_mm"],
+            "tool_results": results,
+        }
+        resp = llm.invoke([SystemMessage(STRESS_SYSTEM_PROMPT), HumanMessage(json.dumps(payload))])
+        txt = getattr(resp, "text", None)  # property in langchain-core >= 1.0, method before
+        notes = (txt if isinstance(txt, str) else txt() if callable(txt) else "") or str(resp.content)
+    except Exception as exc:  # noqa: BLE001 - hotspots stand on their own; the note is advisory
+        log.warning("Stress analyst note skipped: %s", exc)
+        notes = f"(Analyst note unavailable: {describe_llm_error(exc)})"
 
     merged = [h for r in results.values() for h in r["hotspots"]]
     merged.sort(key=lambda h: -h["severity_score"])
@@ -1060,9 +1131,15 @@ def ungrounded_numbers(text: str, context: Any) -> list[str]:
 def compute_verdict(state: AgentState) -> str:
     if any(f["status"] == "FAIL" for f in state["compliance_status"]):
         return "NON_COMPLIANT"
+    findings = state["compliance_status"]
+    checked = [f for f in findings if f["status"] in ("PASS", "FAIL")]
+    if findings and not checked:
+        # Nothing was actually evaluated (rulebook or model unavailable) - do not dress
+        # that up as a near-miss. The engineer must know the check never ran.
+        return "INCOMPLETE"
     active_serious = any(h["reviewer_status"] != "dismissed" and h["estimated_severity"] in ("HIGH", "CRITICAL")
                          for h in state["stress_hotspots"])
-    unverified = any(f["status"] == "NOT_VERIFIABLE" for f in state["compliance_status"])
+    unverified = any(f["status"] == "NOT_VERIFIABLE" for f in findings)
     return "APPROVED_WITH_WARNINGS" if (active_serious or unverified) else "APPROVED"
 
 
@@ -1077,6 +1154,16 @@ def _fallback_narrative(state: AgentState, verdict: str) -> ReportNarrative:
     n_fail = sum(f["status"] == "FAIL" for f in state["compliance_status"])
     n_unv = sum(f["status"] == "NOT_VERIFIABLE" for f in state["compliance_status"])
     n_hot = sum(h["reviewer_status"] != "dismissed" for h in state["stress_hotspots"])
+    if verdict == "INCOMPLETE":
+        return ReportNarrative(
+            executive_summary=(
+                f"Verdict: INCOMPLETE. No rulebook rule was evaluated on this run, so compliance is unknown "
+                f"and this part must not be considered reviewed. Geometry was measured successfully "
+                f"({n_hot} active stress hotspots from heuristic screening). No FEA stresses were computed."),
+            recommendations=["Restore the rulebook index (ingest) or the LLM connection, then re-run the review.",
+                             "Do not release this part on the strength of this report: no rule was checked.",
+                             "Confirm hotspots with a solver or an engineer before relying on them."],
+        )
     return ReportNarrative(
         executive_summary=(f"Verdict: {verdict}. Compliance failures: {n_fail}. Rules not verifiable from geometry: {n_unv}. "
                            f"Active stress hotspots: {n_hot}. Heuristic screening only - no FEA stresses were computed."),
@@ -1097,8 +1184,12 @@ def reporter_node(state: AgentState) -> dict:
     narrative: ReportNarrative | None = None
     feedback = ""
     for _ in range(2):  # one retry if the model invents numbers
-        cand = llm.invoke([SystemMessage(REPORTER_SYSTEM_PROMPT),
-                           HumanMessage(json.dumps(context, default=str) + feedback)])
+        try:
+            cand = llm.invoke([SystemMessage(REPORTER_SYSTEM_PROMPT),
+                               HumanMessage(json.dumps(context, default=str) + feedback)])
+        except Exception as exc:  # noqa: BLE001 - every number is already verified in state
+            log.warning("Reporter LLM unavailable (%s); using the coded narrative.", describe_llm_error(exc))
+            break
         bad = ungrounded_numbers(cand.executive_summary + " " + " ".join(cand.recommendations), context) if cand else ["?"]
         if cand and not bad:
             narrative = cand
@@ -1135,6 +1226,14 @@ def reporter_node(state: AgentState) -> dict:
         f"*Generated {now.isoformat(timespec='seconds')} | Verdict: **{verdict}***",
         "> Advisory output. Geometry numbers come from CAD tools; stress findings are geometric heuristics, "
         "not FEA results. Final sign-off belongs to the reviewing engineer.",
+    ]
+    if verdict == "INCOMPLETE":
+        md.append(
+            "> **INCOMPLETE — no rulebook rule was actually evaluated.** The rulebook index or the "
+            "compliance model was unavailable for this run, so nothing was verified against the rulebook. "
+            "Re-run after fixing the cause above; do not treat this part as reviewed."
+        )
+    md += [
         "## Executive summary", narrative.executive_summary,
         "## Extracted properties", _md_table(["Property", "Value"], prop_rows),
         "## Rulebook compliance", _md_table(["Rule", "Requirement", "Status", "Check", "Reasoning"], comp_rows),
@@ -1269,6 +1368,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     print("\n" + final["final_report"])
     print(f"\nVERDICT: {final['verdict']}" + (f" | report: {final['report_path']}" if final.get("report_path") else ""))
+    # 0 = reviewed and acceptable; 1 = not acceptable OR not fully reviewed.
     return 0 if final["verdict"] in ("APPROVED", "APPROVED_WITH_WARNINGS") else 1
 
 

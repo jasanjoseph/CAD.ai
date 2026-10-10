@@ -61,28 +61,39 @@ for (a) tool-call argument passing, (b) rulebook interpretation, (c) prose.
 | `stress_notes` | `str` | stress_reviewer | advisory LLM prose (no numbers allowed) |
 | `fea_job` | `dict` | stress_reviewer | external-solver stub + heuristic summaries |
 | `human_review` | `dict` | human_review | `{approved, reviewer, notes, dismissed_hotspots, timestamp_utc}` |
-| `verdict` | `str` | reporter | `APPROVED` / `APPROVED_WITH_WARNINGS` / `NON_COMPLIANT` / `FAILED` / `REJECTED` |
+| `verdict` | `str` | reporter | `APPROVED` / `APPROVED_WITH_WARNINGS` / `NON_COMPLIANT` / `INCOMPLETE` / `FAILED` / `REJECTED` |
 | `report_path` | `str` \| `None` | reporter | written markdown file |
 
-Verdict is **computed by code** (`compute_verdict`), never by the LLM:
-any validated `FAIL` ⇒ `NON_COMPLIANT`; else any active `HIGH`/`CRITICAL`
+Verdict is **computed by code** (`compute_verdict`), never by the LLM, in this order:
+any validated `FAIL` ⇒ `NON_COMPLIANT`; else if findings exist but **none** were
+evaluated (rulebook or model unavailable) ⇒ `INCOMPLETE` — deliberately not dressed
+up as a near-miss, because nothing was checked; else any active `HIGH`/`CRITICAL`
 hotspot or any `NOT_VERIFIABLE` rule ⇒ `APPROVED_WITH_WARNINGS`; else `APPROVED`.
+
+Exit code: `0` only for `APPROVED` / `APPROVED_WITH_WARNINGS`; `1` for everything
+else, including `INCOMPLETE`.
 
 ---
 
 ## 3. Node contracts
 
+**Degradation principle:** an unavailable LLM or rulebook must never destroy measured
+data, and must never produce an optimistic result. Nodes fall back to deterministic
+behaviour or report `NOT_VERIFIABLE` / `INCOMPLETE`.
+
 | Node | LLM role | Deterministic core | Failure behaviour |
 |---|---|---|---|
-| `geometry_extractor` | forced tool-call `extract_geometry` (falls back to unfocused call if provider can't force) | trimesh: watertight check, normal fix, mm scaling, b-rep vs mesh volume provenance | no tool call ⇒ `CADToolError` ⇒ failure_handler |
-| `compliance_checker` | interprets rulebook excerpts → structured `ComplianceReport` | retrieval (5 queries, deduped, ≤14 chunks), then `validate_finding()` re-derives every verdict | empty findings ⇒ explicit `NOT_VERIFIABLE` row |
-| `stress_reviewer` | drives heuristics via tool-calls, then ≤120-word advisory note | **coverage guarantee**: any heuristic the LLM skipped is run with defaults; hotspots merged, sorted, re-id'd | tool error ⇒ failure_handler |
+| `geometry_extractor` | relays the already-locked arguments as a tool call | trimesh: watertight check, normal fix, mm scaling, b-rep vs mesh volume provenance | **LLM is optional**: on any error it calls the tool directly, so measurement never depends on a round-trip |
+| `compliance_checker` | interprets rulebook excerpts → structured `ComplianceReport` | retrieval (5 queries, deduped, ≤14 chunks), then `validate_finding()` re-derives every verdict | missing index / unreachable model ⇒ explicit `NOT_VERIFIABLE` rows (with refs still listed) ⇒ verdict `INCOMPLETE` |
+| `stress_reviewer` | one call: ≤120-word advisory note grouping the hotspots | runs all three heuristics directly in Python — they are pure functions, so the LLM cannot skip or alter them | note failure ⇒ hotspots stand alone, note replaced by an explanatory string |
 | `human_review` | — (human is the model) | `interrupt()`; re-runs safely on resume (no side effects before the interrupt) | malformed decision ⇒ treated as rejection |
-| `reporter` | narrative: ≤120-word summary + 3-7 recommendations | tables, verdict, file write; `ungrounded_numbers()` rejects any number absent from state (1 retry, then coded fallback) | fallback narrative, never blocks output |
+| `reporter` | narrative: ≤120-word summary + 3-7 recommendations | tables, verdict, file write; `ungrounded_numbers()` rejects any number absent from state (1 retry) | LLM unreachable ⇒ coded narrative; the report is still written |
 | `failure_handler` | — | renders FAILED or REJECTED text | terminal |
 
 `@safe_node` wraps every spoke: any exception becomes
-`error = "[node] ExceptionType: message"` in state — never a silent fallback.
+`error = "[node] <actionable message>"` in state — never a silent fallback.
+`describe_llm_error()` translates provider exceptions (quota exhausted, invalid key,
+retired model) into one human-readable line instead of a JSON wall.
 
 ---
 
@@ -138,8 +149,36 @@ comparator(<=|>=|<|>|==) · limit_value · status(PASS|FAIL|NOT_VERIFIABLE) · r
 
 ## 8. Providers
 
-| `LLM_PROVIDER` | Chat | Embeddings (default) | Cost |
+| `LLM_PROVIDER` | Chat (`GEMINI_MODEL` / `OPENAI_MODEL` / `ANTHROPIC_MODEL`) | Embeddings (default) | Cost |
 |---|---|---|---|
-| `gemini` | `gemini-3.8-flash` | `models/gemini-embedding-001` | free tier, rate-limited |
+| `gemini` | `gemini-3.5-flash` | `models/gemini-embedding-001` | free tier, rate-limited |
 | `openai` | `gpt-4o` | `text-embedding-3-small` | billed per token |
 | `anthropic` | `claude-sonnet-5-5` | `text-embedding-3-small` (OpenAI key required) | billed per token |
+
+**A review makes 3 LLM calls** (geometry relay, compliance interpretation, reporter)
+plus 5 embedding calls at retrieval — everything else is pure Python.
+
+### Free-tier quota notes (measured, not guessed)
+
+- `gemini-3.8-flash` free tier allows **20 requests/day**, which is roughly two
+  reviews. That is why the default is `gemini-3.5-flash`.
+- Quota resets are per model, so switching `GEMINI_MODEL` in `.env` moves you to a
+  separate budget. No code change or re-ingest needed.
+- Hitting the limit is not fatal: geometry, all three heuristics and the report
+  itself still complete. Compliance comes back `NOT_VERIFIABLE` and the verdict
+  becomes `INCOMPLETE` rather than a false approval.
+
+## 9. Testing
+
+The offline suite needs **no API key and no network** — it proves the pipeline logic
+before anyone spends quota:
+
+```
+.\.venv\Scripts\python.exe -m pip install pytest
+.\.venv\Scripts\python.exe -m pytest -q
+```
+
+55 tests across 7 areas: geometry extraction (volume/mass verified against hand
+calculations), the three heuristics, the anti-hallucination validator, verdict
+rules, reporter number-guarding, graph routing, and two full end-to-end runs with
+the LLM stubbed out (including one that simulates an LLM outage at each stage).

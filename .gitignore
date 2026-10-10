@@ -4,3 +4,5 @@ __pycache__/
 .env
 .rulebook_chroma/
 reports/
+
+tests/parts/
